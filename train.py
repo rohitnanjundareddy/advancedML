@@ -1,446 +1,402 @@
 """
-Few-Shot Learning on HAM10000 Skin Lesion Dataset using Prototypical Networks
-Run this script to automatically train and evaluate a few-shot learning model.
+Training loop for Few-Shot Learning with Prototypical Networks
 """
-
-import os
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
 import numpy as np
-import pandas as pd
-from PIL import Image
-from pathlib import Path
-import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-import seaborn as sns
 from tqdm import tqdm
-import zipfile
-import requests
+import wandb
+from pathlib import Path
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
-DATASET_URL = "https://www.kaggle.com/api/v1/datasets/download/kmader/skin-cancer-mnist-ham10000"
-DATA_DIR = "./ham10000_data"
-EPOCHS = 50
-BATCH_SIZE = 32
-LEARNING_RATE = 0.001
-IMAGE_SIZE = 224
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-# Few-shot settings
-N_WAY = 5  # Number of classes per episode
-K_SHOT = 5  # Number of support examples per class
-N_QUERY = 15  # Number of query examples per class
-
-print(f"Using device: {DEVICE}")
-
-# ============================================================================
-# STEP 1: DOWNLOAD HAM10000 DATASET
-# ============================================================================
-
-def download_ham10000():
-    """Download HAM10000 dataset from Kaggle"""
-    print("\n" + "="*60)
-    print("DOWNLOADING HAM10000 DATASET")
-    print("="*60)
+class Trainer:
+    """Trainer class for few-shot learning"""
     
-    if os.path.exists(DATA_DIR) and len(os.listdir(DATA_DIR)) > 0:
-        print(f"✓ Dataset already exists in {DATA_DIR}")
-        return
-    
-    print("\nTo download HAM10000 from Kaggle, you need:")
-    print("1. Kaggle account")
-    print("2. Kaggle API key (kaggle.json)")
-    print("\nSetup instructions:")
-    print("   1. Go to kaggle.com/account")
-    print("   2. Click 'Create New API Token'")
-    print("   3. Place kaggle.json in ~/.kaggle/ (Linux/Mac) or C:\\Users\\<You>\\.kaggle\\ (Windows)")
-    
-    try:
-        # Try using Kaggle API
-        import kaggle
+    def __init__(self, model, config, train_dataset, val_dataset):
+        """
+        Args:
+            model: Prototypical Network model
+            config: Configuration object
+            train_dataset: Training dataset
+            val_dataset: Validation dataset
+        """
+        self.model = model.to(config.DEVICE)
+        self.config = config
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.device = config.DEVICE
         
-        os.makedirs(DATA_DIR, exist_ok=True)
-        
-        print("\nDownloading HAM10000 dataset...")
-        kaggle.api.dataset_download_files(
-            'kmader/skin-cancer-mnist-ham10000',
-            path=DATA_DIR,
-            unzip=True
+        # Optimizer and scheduler
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY
         )
-        print("✓ Dataset downloaded successfully!")
+        self.scheduler = StepLR(
+            self.optimizer,
+            step_size=config.SCHEDULER_STEP,
+            gamma=config.SCHEDULER_GAMMA
+        )
         
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        print("\nAlternative: Manual Download")
-        print("1. Go to: https://www.kaggle.com/kmader/skin-cancer-mnist-ham10000")
-        print("2. Download the dataset")
-        print(f"3. Extract to: {DATA_DIR}")
-        print("4. Re-run this script")
-        exit(1)
-
-# ============================================================================
-# STEP 2: DATASET CLASS
-# ============================================================================
-
-class HAM10000Dataset(Dataset):
-    """HAM10000 Skin Lesion Dataset"""
+        # Tracking
+        self.best_val_acc = 0.0
+        self.train_losses = []
+        self.train_accs = []
+        self.val_accs = []
+        
+        # Initialize wandb if enabled
+        if config.USE_WANDB:
+            wandb.init(
+                project=config.WANDB_PROJECT,
+                config={
+                    "backbone": config.BACKBONE,
+                    "n_way": config.N_WAY,
+                    "k_shot": config.K_SHOT,
+                    "learning_rate": config.LEARNING_RATE,
+                    "embedding_dim": config.EMBEDDING_DIM,
+                }
+            )
+            wandb.watch(self.model)
     
-    def __init__(self, data_dir, split='train', transform=None):
-        self.data_dir = Path(data_dir)
-        self.transform = transform
-        self.split = split
+    def train_epoch(self, epoch):
+        """Train for one epoch"""
+        self.model.train()
+        epoch_losses = []
+        epoch_accs = []
         
-        # Load metadata
-        metadata_path = self.data_dir / 'HAM10000_metadata.csv'
-        if not metadata_path.exists():
-            # Try alternative names
-            csv_files = list(self.data_dir.glob('*.csv'))
-            if csv_files:
-                metadata_path = csv_files[0]
-            else:
-                raise FileNotFoundError(f"No CSV file found in {data_dir}")
+        pbar = tqdm(range(self.config.NUM_EPISODES), desc=f"Epoch {epoch+1}/{self.config.NUM_EPOCHS}")
         
-        self.metadata = pd.read_csv(metadata_path)
+        for episode_idx in pbar:
+            # Sample episode
+            support_images, support_labels, query_images, query_labels = \
+                self.train_dataset.sample_episode(
+                    self.config.N_WAY,
+                    self.config.K_SHOT,
+                    self.config.N_QUERY
+                )
+            
+            # Move to device
+            support_images = support_images.to(self.device)
+            support_labels = support_labels.to(self.device)
+            query_images = query_images.to(self.device)
+            query_labels = query_labels.to(self.device)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            logits = self.model(
+                support_images, support_labels, query_images,
+                self.config.N_WAY, self.config.K_SHOT
+            )
+            
+            # Compute loss
+            loss = F.cross_entropy(logits, query_labels)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Compute accuracy
+            predictions = torch.argmax(logits, dim=1)
+            accuracy = (predictions == query_labels).float().mean().item()
+            
+            epoch_losses.append(loss.item())
+            epoch_accs.append(accuracy)
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{np.mean(epoch_losses):.4f}',
+                'acc': f'{np.mean(epoch_accs):.4f}'
+            })
+            
+            # Log to wandb
+            if self.config.USE_WANDB and episode_idx % self.config.LOG_INTERVAL == 0:
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/accuracy": accuracy,
+                    "train/epoch": epoch,
+                })
         
-        # Find image directories
-        img_dirs = []
-        for d in ['HAM10000_images_part_1', 'HAM10000_images_part_2', 'HAM10000_images']:
-            img_path = self.data_dir / d
-            if img_path.exists():
-                img_dirs.append(img_path)
+        # Step scheduler
+        self.scheduler.step()
         
-        if not img_dirs:
-            # Images might be directly in data_dir
-            img_files = list(self.data_dir.glob('*.jpg'))
-            if img_files:
-                img_dirs = [self.data_dir]
+        avg_loss = np.mean(epoch_losses)
+        avg_acc = np.mean(epoch_accs)
         
-        self.img_dirs = img_dirs
+        self.train_losses.append(avg_loss)
+        self.train_accs.append(avg_acc)
         
-        # Split data
-        total_samples = len(self.metadata)
-        train_size = int(0.7 * total_samples)
-        val_size = int(0.15 * total_samples)
-        
-        if split == 'train':
-            self.metadata = self.metadata.iloc[:train_size]
-        elif split == 'val':
-            self.metadata = self.metadata.iloc[train_size:train_size+val_size]
-        else:  # test
-            self.metadata = self.metadata.iloc[train_size+val_size:]
-        
-        self.metadata = self.metadata.reset_index(drop=True)
-        
-        # Class mapping
-        self.classes = sorted(self.metadata['dx'].unique())
-        self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
-        
-        print(f"{split} set: {len(self.metadata)} images, {len(self.classes)} classes")
+        return avg_loss, avg_acc
     
-    def __len__(self):
-        return len(self.metadata)
+    def evaluate(self, dataset, n_episodes=None):
+        """
+        Evaluate on dataset
+        Args:
+            dataset: Dataset to evaluate on
+            n_episodes: Number of episodes (if None, use config.NUM_EVAL_EPISODES)
+        Returns:
+            avg_accuracy: Average accuracy
+            confidence_interval: 95% confidence interval
+        """
+        if n_episodes is None:
+            n_episodes = self.config.NUM_EVAL_EPISODES
+        
+        self.model.eval()
+        accuracies = []
+        
+        with torch.no_grad():
+            for _ in tqdm(range(n_episodes), desc="Evaluating"):
+                # Sample episode
+                support_images, support_labels, query_images, query_labels = \
+                    dataset.sample_episode(
+                        self.config.N_WAY,
+                        self.config.K_SHOT,
+                        self.config.N_QUERY
+                    )
+                
+                # Move to device
+                support_images = support_images.to(self.device)
+                support_labels = support_labels.to(self.device)
+                query_images = query_images.to(self.device)
+                query_labels = query_labels.to(self.device)
+                
+                # Forward pass
+                logits = self.model(
+                    support_images, support_labels, query_images,
+                    self.config.N_WAY, self.config.K_SHOT
+                )
+                
+                # Compute accuracy
+                predictions = torch.argmax(logits, dim=1)
+                accuracy = (predictions == query_labels).float().mean().item()
+                accuracies.append(accuracy)
+        
+        # Compute statistics
+        avg_accuracy = np.mean(accuracies)
+        std_accuracy = np.std(accuracies)
+        confidence_interval = 1.96 * std_accuracy / np.sqrt(n_episodes)
+        
+        return avg_accuracy, confidence_interval
     
-    def __getitem__(self, idx):
-        row = self.metadata.iloc[idx]
-        img_name = row['image_id'] + '.jpg'
+    def train(self):
+        """Main training loop"""
+        print(f"\nStarting training on {self.device}")
+        print(f"Backbone: {self.config.BACKBONE}")
+        print(f"Embedding dimension: {self.config.EMBEDDING_DIM}")
+        print(f"Training: {self.config.N_WAY}-way {self.config.K_SHOT}-shot")
+        print(f"Episodes per epoch: {self.config.NUM_EPISODES}")
+        print()
         
-        # Find image in one of the directories
-        img_path = None
-        for img_dir in self.img_dirs:
-            potential_path = img_dir / img_name
-            if potential_path.exists():
-                img_path = potential_path
-                break
+        for epoch in range(self.config.NUM_EPOCHS):
+            # Train
+            train_loss, train_acc = self.train_epoch(epoch)
+            
+            # Validate
+            val_acc, val_ci = self.evaluate(self.val_dataset)
+            self.val_accs.append(val_acc)
+            
+            # Print results
+            print(f"\nEpoch {epoch+1}/{self.config.NUM_EPOCHS}")
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  Train Acc:  {train_acc:.4f}")
+            print(f"  Val Acc:    {val_acc:.4f} ± {val_ci:.4f}")
+            print(f"  LR:         {self.optimizer.param_groups[0]['lr']:.6f}")
+            
+            # Log to wandb
+            if self.config.USE_WANDB:
+                wandb.log({
+                    "epoch": epoch,
+                    "train/epoch_loss": train_loss,
+                    "train/epoch_accuracy": train_acc,
+                    "val/accuracy": val_acc,
+                    "val/confidence_interval": val_ci,
+                    "learning_rate": self.optimizer.param_groups[0]['lr'],
+                })
+            
+            # Save best model
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                self.save_checkpoint(epoch, is_best=True)
+                print(f"  New best model! Val Acc: {val_acc:.4f}")
+            
+            # Save periodic checkpoint
+            if (epoch + 1) % self.config.SAVE_INTERVAL == 0:
+                self.save_checkpoint(epoch, is_best=False)
         
-        if img_path is None:
-            raise FileNotFoundError(f"Image not found: {img_name}")
+        print(f"\nTraining completed!")
+        print(f"Best validation accuracy: {self.best_val_acc:.4f}")
         
-        # Load image
-        image = Image.open(img_path).convert('RGB')
+        return self.best_val_acc
+    
+    def save_checkpoint(self, epoch, is_best=False):
+        """Save model checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_acc': self.best_val_acc,
+            'config': self.config,
+        }
         
-        if self.transform:
-            image = self.transform(image)
+        if is_best:
+            path = self.config.CHECKPOINT_DIR / "best_model.pth"
+        else:
+            path = self.config.CHECKPOINT_DIR / f"checkpoint_epoch_{epoch+1}.pth"
         
-        label = self.class_to_idx[row['dx']]
-        
-        return image, label
+        torch.save(checkpoint, path)
+        print(f"  Saved checkpoint: {path}")
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load model checkpoint"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.best_val_acc = checkpoint['best_val_acc']
+        print(f"Loaded checkpoint from {checkpoint_path}")
+        return checkpoint['epoch']
 
-# ============================================================================
-# STEP 3: FEW-SHOT SAMPLER
-# ============================================================================
 
-class FewShotSampler:
-    """Sample N-way K-shot episodes"""
+class AdvancedEvaluator:
+    """Advanced evaluation across multiple scenarios"""
     
-    def __init__(self, dataset, n_way=5, k_shot=5, n_query=15):
+    def __init__(self, model, config, dataset):
+        """
+        Args:
+            model: Trained model
+            config: Configuration object
+            dataset: Dataset to evaluate on
+        """
+        self.model = model.to(config.DEVICE)
+        self.config = config
         self.dataset = dataset
-        self.n_way = n_way
-        self.k_shot = k_shot
-        self.n_query = n_query
-        
-        # Organize by class
-        self.class_to_indices = {}
-        for idx in range(len(dataset)):
-            _, label = dataset[idx]
-            if label not in self.class_to_indices:
-                self.class_to_indices[label] = []
-            self.class_to_indices[label].append(idx)
-        
-        self.classes = list(self.class_to_indices.keys())
+        self.device = config.DEVICE
+        self.model.eval()
     
-    def sample_episode(self):
-        """Sample one episode"""
-        # Sample N classes
-        episode_classes = np.random.choice(self.classes, size=self.n_way, replace=False)
+    def evaluate_multiple_shots(self, n_way=5, k_shots=[1, 5, 10, 20], n_query=15, n_episodes=600):
+        """
+        Evaluate performance across different k-shot scenarios
+        Args:
+            n_way: Number of classes
+            k_shots: List of k-shot values to test
+            n_query: Number of query examples
+            n_episodes: Number of episodes per scenario
+        Returns:
+            results: Dictionary of results
+        """
+        results = {}
         
-        support_imgs, support_labels = [], []
-        query_imgs, query_labels = [], []
+        print(f"\nEvaluating {n_way}-way classification with different shots:")
         
-        for class_idx, class_label in enumerate(episode_classes):
-            indices = self.class_to_indices[class_label]
+        for k_shot in k_shots:
+            print(f"\n{k_shot}-shot learning:")
+            accuracies = []
             
-            # Sample K+Q examples
-            n_samples = self.k_shot + self.n_query
-            if len(indices) < n_samples:
-                sampled = np.random.choice(indices, size=n_samples, replace=True)
-            else:
-                sampled = np.random.choice(indices, size=n_samples, replace=False)
+            with torch.no_grad():
+                for _ in tqdm(range(n_episodes), desc=f"  {k_shot}-shot"):
+                    # Sample episode
+                    support_images, support_labels, query_images, query_labels = \
+                        self.dataset.sample_episode(n_way, k_shot, n_query)
+                    
+                    # Move to device
+                    support_images = support_images.to(self.device)
+                    support_labels = support_labels.to(self.device)
+                    query_images = query_images.to(self.device)
+                    query_labels = query_labels.to(self.device)
+                    
+                    # Forward pass
+                    logits = self.model(
+                        support_images, support_labels, query_images,
+                        n_way, k_shot
+                    )
+                    
+                    # Compute accuracy
+                    predictions = torch.argmax(logits, dim=1)
+                    accuracy = (predictions == query_labels).float().mean().item()
+                    accuracies.append(accuracy)
             
-            # Split into support and query
-            for i, idx in enumerate(sampled):
-                img, _ = self.dataset[idx]
-                if i < self.k_shot:
-                    support_imgs.append(img)
-                    support_labels.append(class_idx)
-                else:
-                    query_imgs.append(img)
-                    query_labels.append(class_idx)
-        
-        return (torch.stack(support_imgs), torch.tensor(support_labels),
-                torch.stack(query_imgs), torch.tensor(query_labels))
-
-# ============================================================================
-# STEP 4: PROTOTYPICAL NETWORK MODEL
-# ============================================================================
-
-class PrototypicalNetwork(nn.Module):
-    """Simple Prototypical Network with ResNet backbone"""
-    
-    def __init__(self, embedding_dim=512):
-        super().__init__()
-        
-        # Use pretrained ResNet18 as backbone
-        resnet = models.resnet18(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
-        
-        # Projection head
-        self.projection = nn.Sequential(
-            nn.Linear(512, embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-    
-    def forward(self, x):
-        """Extract features"""
-        features = self.backbone(x)
-        features = features.view(features.size(0), -1)
-        embeddings = self.projection(features)
-        return embeddings
-    
-    def compute_prototypes(self, support_embeddings, support_labels, n_way):
-        """Compute class prototypes"""
-        prototypes = []
-        for i in range(n_way):
-            class_mask = support_labels == i
-            prototype = support_embeddings[class_mask].mean(dim=0)
-            prototypes.append(prototype)
-        return torch.stack(prototypes)
-    
-    def predict(self, support_imgs, support_labels, query_imgs, n_way):
-        """Predict query labels"""
-        # Get embeddings
-        support_emb = self.forward(support_imgs)
-        query_emb = self.forward(query_imgs)
-        
-        # Compute prototypes
-        prototypes = self.compute_prototypes(support_emb, support_labels, n_way)
-        
-        # Compute distances
-        distances = torch.cdist(query_emb, prototypes)
-        
-        # Predictions
-        return torch.argmin(distances, dim=1)
-
-# ============================================================================
-# STEP 5: TRAINING
-# ============================================================================
-
-def train_few_shot(model, sampler, num_episodes=1000):
-    
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    
-    losses = []
-    accuracies = []
-    
-    pbar = tqdm(range(num_episodes), desc='Training')
-    for episode in pbar:
-        # Sample episode
-        sup_imgs, sup_labels, qry_imgs, qry_labels = sampler.sample_episode()
-        
-        sup_imgs = sup_imgs.to(DEVICE)
-        sup_labels = sup_labels.to(DEVICE)
-        qry_imgs = qry_imgs.to(DEVICE)
-        qry_labels = qry_labels.to(DEVICE)
-        
-        # Forward
-        optimizer.zero_grad()
-        
-        sup_emb = model(sup_imgs)
-        qry_emb = model(qry_imgs)
-        
-        prototypes = model.compute_prototypes(sup_emb, sup_labels, N_WAY)
-        distances = torch.cdist(qry_emb, prototypes)
-        log_probs = F.log_softmax(-distances, dim=1)
-        
-        # Loss
-        loss = F.nll_loss(log_probs, qry_labels)
-        
-        # Backward
-        loss.backward()
-        optimizer.step()
-        
-        # Metrics
-        preds = torch.argmin(distances, dim=1)
-        acc = (preds == qry_labels).float().mean().item()
-        
-        losses.append(loss.item())
-        accuracies.append(acc)
-        
-        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{acc:.4f}'})
-    
-    # Plot training curves
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    
-    ax1.plot(losses)
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Training Loss')
-    ax1.grid(True)
-    
-    ax2.plot(accuracies)
-    ax2.set_xlabel('Episode')
-    ax2.set_ylabel('Accuracy')
-    ax2.set_title('Training Accuracy')
-    ax2.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('training_curves2.png', dpi=150)
-    print("\n✓ Training curves saved to training_curves.png")
-    
-    return model
-
-# ============================================================================
-# STEP 6: EVALUATION
-# ============================================================================
-
-def evaluate_few_shot(model, sampler, num_episodes=200):
-    """Evaluate on test episodes"""
-    print("\n" + "="*60)
-    print("EVALUATING MODEL")
-    print("="*60)
-    
-    model.eval()
-    accuracies = []
-    
-    with torch.no_grad():
-        for _ in tqdm(range(num_episodes), desc='Evaluating'):
-            sup_imgs, sup_labels, qry_imgs, qry_labels = sampler.sample_episode()
+            # Compute statistics
+            avg_acc = np.mean(accuracies)
+            std_acc = np.std(accuracies)
+            ci = 1.96 * std_acc / np.sqrt(n_episodes)
             
-            sup_imgs = sup_imgs.to(DEVICE)
-            sup_labels = sup_labels.to(DEVICE)
-            qry_imgs = qry_imgs.to(DEVICE)
-            qry_labels = qry_labels.to(DEVICE)
+            results[f"{k_shot}-shot"] = {
+                'accuracy': avg_acc,
+                'std': std_acc,
+                'ci': ci,
+                'all_accuracies': accuracies
+            }
             
-            preds = model.predict(sup_imgs, sup_labels, qry_imgs, N_WAY)
-            acc = (preds == qry_labels).float().mean().item()
-            accuracies.append(acc)
+            print(f"  Accuracy: {avg_acc:.4f} ± {ci:.4f}")
+        
+        return results
     
-    # Statistics
-    mean_acc = np.mean(accuracies)
-    std_acc = np.std(accuracies)
-    ci = 1.96 * std_acc / np.sqrt(num_episodes)
-    
-    print(f"\nResults ({N_WAY}-way {K_SHOT}-shot):")
-    print(f"  Mean Accuracy: {mean_acc:.4f} ± {ci:.4f}")
-    print(f"  Std Dev: {std_acc:.4f}")
-    print(f"  Min: {min(accuracies):.4f}")
-    print(f"  Max: {max(accuracies):.4f}")
-    
-    # Plot accuracy distribution
-    plt.figure(figsize=(10, 6))
-    plt.hist(accuracies, bins=30, edgecolor='black', alpha=0.7)
-    plt.axvline(mean_acc, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_acc:.4f}')
-    plt.xlabel('Accuracy')
-    plt.ylabel('Frequency')
-    plt.title(f'Test Accuracy Distribution ({num_episodes} episodes)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig('accuracy_distribution.png', dpi=150)
-    print("✓ Accuracy distribution saved to accuracy_distribution.png")
-    
-    return mean_acc
+    def evaluate_multiple_ways(self, n_ways=[2, 5, 10], k_shot=5, n_query=15, n_episodes=600):
+        """
+        Evaluate performance across different n-way scenarios
+        Args:
+            n_ways: List of n-way values to test
+            k_shot: Number of support examples
+            n_query: Number of query examples
+            n_episodes: Number of episodes per scenario
+        Returns:
+            results: Dictionary of results
+        """
+        results = {}
+        
+        print(f"\nEvaluating {k_shot}-shot learning with different ways:")
+        
+        for n_way in n_ways:
+            # Skip if dataset doesn't have enough classes
+            if n_way > len(self.dataset.classes):
+                print(f"  Skipping {n_way}-way (only {len(self.dataset.classes)} classes available)")
+                continue
+            
+            print(f"\n{n_way}-way classification:")
+            accuracies = []
+            
+            with torch.no_grad():
+                for _ in tqdm(range(n_episodes), desc=f"  {n_way}-way"):
+                    # Sample episode
+                    support_images, support_labels, query_images, query_labels = \
+                        self.dataset.sample_episode(n_way, k_shot, n_query)
+                    
+                    # Move to device
+                    support_images = support_images.to(self.device)
+                    support_labels = support_labels.to(self.device)
+                    query_images = query_images.to(self.device)
+                    query_labels = query_labels.to(self.device)
+                    
+                    # Forward pass
+                    logits = self.model(
+                        support_images, support_labels, query_images,
+                        n_way, k_shot
+                    )
+                    
+                    # Compute accuracy
+                    predictions = torch.argmax(logits, dim=1)
+                    accuracy = (predictions == query_labels).float().mean().item()
+                    accuracies.append(accuracy)
+            
+            # Compute statistics
+            avg_acc = np.mean(accuracies)
+            std_acc = np.std(accuracies)
+            ci = 1.96 * std_acc / np.sqrt(n_episodes)
+            
+            results[f"{n_way}-way"] = {
+                'accuracy': avg_acc,
+                'std': std_acc,
+                'ci': ci,
+                'all_accuracies': accuracies
+            }
+            
+            print(f"  Accuracy: {avg_acc:.4f} ± {ci:.4f}")
+        
+        return results
 
-# ============================================================================
-# MAIN
-# ============================================================================
 
-def main():
-    print("\n" + "="*60)
-    print("FEW-SHOT LEARNING ON HAM10000")
-    print("="*60)
-    
-    # Download dataset
-    download_ham10000()
-    
-    # Transforms
-    transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
-    ])
-    
-    # Load datasets
-    print("\nLoading datasets...")
-    train_dataset = HAM10000Dataset(DATA_DIR, split='train', transform=transform)
-    test_dataset = HAM10000Dataset(DATA_DIR, split='test', transform=transform)
-    
-    # Few-shot learning with Prototypical Networks
-    print(f"\nStarting {N_WAY}-way {K_SHOT}-shot learning...")
-    train_sampler = FewShotSampler(train_dataset, N_WAY, K_SHOT, N_QUERY)
-    test_sampler = FewShotSampler(test_dataset, N_WAY, K_SHOT, N_QUERY)
-    
-    model = PrototypicalNetwork().to(DEVICE)
-    model = train_few_shot(model, train_sampler, num_episodes=1000)
-    
-    # Save model
-    torch.save(model.state_dict(), 'prototypical_model.pth')
-    print("\n✓ Model saved to prototypical_model.pth")
-    
-    # Evaluate
-    evaluate_few_shot(model, test_sampler, num_episodes=200)
-    
-    print("\n" + "="*60)
-    print("TRAINING COMPLETE!")
-    print("="*60)
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    print("Training module loaded successfully")
 
